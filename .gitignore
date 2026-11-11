@@ -1,0 +1,10 @@
+.venv/
+.idea/
+__pycache__/
+build/
+dist/
+*.spec
+# may hold real guest data
+hotel.db
+otel.zip
+*.xlsx

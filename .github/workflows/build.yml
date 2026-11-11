@@ -1,0 +1,21 @@
+name: Build Windows exe
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: python test_otel.py
+        env:
+          PYTHONUTF8: "1"
+      - run: pyinstaller --onefile --windowed --name OtelYonetim otel.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OtelYonetim
+          path: dist/OtelYonetim.exe
