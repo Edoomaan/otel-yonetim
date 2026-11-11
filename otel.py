@@ -10,16 +10,45 @@ from openpyxl import Workbook
 # Fixed per-user folder, so the data survives moving the .exe around.
 DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "OtelYonetim"
 
-EXPORT_HEADERS = ["Oda No", "Oda Tipi", "Ad Soyad", "TC No", "Doğum Yılı", "Giriş", "Çıkış", "Ödeme", "3. Kişi", "Ücret", "Durum"]
+EXPORT_HEADERS = ["Oda No", "Oda Tipi", "Ad Soyad", "TC No", "Doğum Tarihi", "Giriş", "Çıkış", "Ödeme", "3. Kişi", "Ücret", "Durum"]
 
 
-def validate(tc, check_out):
-    """Return an error message, or None when the input is fine."""
-    if not (tc.isdigit() and len(tc) == 11):
-        return "TC Kimlik No 11 haneli bir sayı olmalıdır!"
+def is_valid_tc(tc):
+    """Check the two control digits of a Turkish ID number."""
+    if not (tc.isdigit() and len(tc) == 11) or tc[0] == "0":
+        return False
+    d = [int(c) for c in tc]
+    # d[0:9:2] = 1st, 3rd, 5th, 7th, 9th digits; d[1:8:2] = 2nd, 4th, 6th, 8th
+    tenth = (sum(d[0:9:2]) * 7 - sum(d[1:8:2])) % 10
+    eleventh = sum(d[:10]) % 10
+    return d[9] == tenth and d[10] == eleventh
+
+
+def is_valid_date(text):
     try:
-        datetime.strptime(check_out, "%d.%m.%Y")
+        datetime.strptime(text, "%d.%m.%Y")
+        return True
     except ValueError:
+        return False
+
+
+def format_date(text):
+    """Turn typed digits into GG.AA.YYYY, adding each dot as soon as its part is complete."""
+    d = "".join(c for c in text if c.isdigit())[:8]
+    if len(d) < 2:
+        return d
+    if len(d) < 4:
+        return f"{d[:2]}.{d[2:]}"
+    return f"{d[:2]}.{d[2:4]}.{d[4:]}"
+
+
+def validate(tc, birth, check_out):
+    """Return an error message, or None when the input is fine."""
+    if not is_valid_tc(tc):
+        return "Geçersiz TC Kimlik No! 11 haneyi kontrol edip tekrar girin."
+    if birth and not is_valid_date(birth):
+        return "Doğum tarihi GG.AA.YYYY biçiminde olmalıdır! (örnek: 05.03.1990)"
+    if not is_valid_date(check_out):
         return "Çıkış tarihi GG.AA.YYYY biçiminde olmalıdır! (örnek: 25.11.2026)"
     return None
 
@@ -112,7 +141,7 @@ class HotelApp:
                                 TEXT,
                                 tc_no
                                 TEXT,
-                                birth_year
+                                birth_year -- shortcut: now holds a full date; renaming needs a migration of existing databases
                                 TEXT,
                                 check_in
                                 TEXT,
@@ -168,17 +197,21 @@ class HotelApp:
         self.entry_name.grid(row=1, column=1, pady=4)
 
         ttk.Label(left_frame, text="TC Kimlik No:").grid(row=2, column=0, sticky="w", pady=4)
-        self.entry_tc = ttk.Entry(left_frame)
+        # Reject the keystroke unless the field would still be at most 11 digits (%P = text after the edit).
+        only_tc_digits = (self.root.register(lambda text: len(text) <= 11 and (text.isdigit() or text == "")), "%P")
+        self.entry_tc = ttk.Entry(left_frame, validate="key", validatecommand=only_tc_digits)
         self.entry_tc.grid(row=2, column=1, pady=4)
 
-        ttk.Label(left_frame, text="Doğum Yılı:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(left_frame, text="Doğum Tarihi (GG.AA.YYYY):").grid(row=3, column=0, sticky="w", pady=4)
         self.entry_birth = ttk.Entry(left_frame)
         self.entry_birth.grid(row=3, column=1, pady=4)
+        self.entry_birth.bind("<KeyRelease>", self.on_date_key)
 
         ttk.Label(left_frame, text="Çıkış Tarihi (GG.AA.YYYY):").grid(row=4, column=0, sticky="w", pady=4)
         self.entry_out = ttk.Entry(left_frame)
         self.entry_out.insert(0, datetime.now().strftime("%d.%m.%Y"))
         self.entry_out.grid(row=4, column=1, pady=4)
+        self.entry_out.bind("<KeyRelease>", self.on_date_key)
 
         ttk.Label(left_frame, text="Ödeme Şekli:").grid(row=5, column=0, sticky="w", pady=4)
         self.payment_cb = ttk.Combobox(left_frame, values=["Nakit", "Kredi Kartı", "EFT"], width=22, state="readonly")
@@ -228,6 +261,16 @@ class HotelApp:
 
         self.load_reservations()
 
+    def on_date_key(self, event):
+        if event.keysym == "BackSpace":  # otherwise a deleted dot would come straight back
+            return
+        entry = event.widget
+        formatted = format_date(entry.get())
+        if formatted != entry.get():
+            # shortcut: the cursor jumps to the end, so fixing a digit mid-date is clumsy; track the cursor if that annoys
+            entry.delete(0, tk.END)
+            entry.insert(0, formatted)
+
     def update_price(self, event):
         selected_text = self.room_cb.get()
         room_no = selected_text.split(" ")[0]
@@ -264,7 +307,7 @@ class HotelApp:
             messagebox.showerror("Hata", "Lütfen kalan adı soyadı ve TC Kimlik No alanlarını doldurun!")
             return
 
-        error = validate(tc, cout)
+        error = validate(tc, birth, cout)
         if error:
             messagebox.showerror("Hata", error)
             return
