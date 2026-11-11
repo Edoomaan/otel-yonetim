@@ -1,14 +1,24 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+import hashlib
+import json
 import os
 import sqlite3
-from datetime import datetime
+import sys
+import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openpyxl import Workbook
 
 # Fixed per-user folder, so the data survives moving the .exe around.
 DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "OtelYonetim"
+
+# Release builds stamp the tag number here (tag v3 -> "3"); "0" is a test build.
+APP_VERSION = "0"
+RELEASE_API = "https://api.github.com/repos/Edoomaan/otel-yonetim/releases/latest"
+EXE_NAME = "OtelYonetim.exe"
+DATE_FORMAT = "%d.%m.%Y"
 
 EXPORT_HEADERS = ["Oda No", "Oda Tipi", "Ad Soyad", "TC No", "Doğum Tarihi", "Giriş", "Çıkış", "Ödeme", "3. Kişi", "Ücret", "Durum"]
 
@@ -24,10 +34,24 @@ def is_valid_tc(tc):
     return d[9] == tenth and d[10] == eleventh
 
 
-def is_valid_date(text):
+def parse_date(text):
+    """Return the date for a GG.AA.YYYY text, or None when it is not a real date."""
     try:
-        datetime.strptime(text, "%d.%m.%Y")
-        return True
+        return datetime.strptime(text, DATE_FORMAT)
+    except ValueError:
+        return None
+
+
+def count_nights(check_in, check_out):
+    """Nights between two dates: at least 1, and 1 while a date is still being typed."""
+    start, end = parse_date(check_in), parse_date(check_out)
+    return max(1, (end - start).days) if start and end else 1
+
+
+def is_newer(tag, current):
+    """True when a release tag like "v3" is a higher number than the running version."""
+    try:
+        return int(tag.lstrip("v")) > int(current)
     except ValueError:
         return False
 
@@ -42,14 +66,16 @@ def format_date(text):
     return f"{d[:2]}.{d[2:4]}.{d[4:]}"
 
 
-def validate(tc, birth, check_out):
+def validate(tc, birth, check_out, check_in):
     """Return an error message, or None when the input is fine."""
     if not is_valid_tc(tc):
         return "Geçersiz TC Kimlik No! 11 haneyi kontrol edip tekrar girin."
-    if birth and not is_valid_date(birth):
+    if birth and not parse_date(birth):
         return "Doğum tarihi GG.AA.YYYY biçiminde olmalıdır! (örnek: 05.03.1990)"
-    if not is_valid_date(check_out):
+    if not parse_date(check_out):
         return "Çıkış tarihi GG.AA.YYYY biçiminde olmalıdır! (örnek: 25.11.2026)"
+    if parse_date(check_out) < parse_date(check_in):
+        return f"Çıkış tarihi giriş tarihinden ({check_in}) önce olamaz!"
     return None
 
 
@@ -95,6 +121,12 @@ class HotelApp:
             "Büyük Oda": {"Nakit": 1800, "Diger": 1950},
             "Suit Oda": {"Nakit": 2050, "Diger": 2150}
         }
+
+        if getattr(sys, "frozen", False):  # leftover from the last update; it could not delete itself while running
+            try:
+                Path(sys.executable).with_suffix(".old").unlink(missing_ok=True)
+            except OSError:
+                pass
 
         # Veritabanı bağlantısı
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -173,6 +205,56 @@ class HotelApp:
         btn_refresh = ttk.Button(self.tab_dashboard, text="Verileri Yenile", command=self.refresh_dashboard)
         btn_refresh.pack(pady=20)
 
+        self.btn_update = ttk.Button(self.tab_dashboard, text="🔄 Güncellemeleri Denetle", command=self.check_for_update)
+        self.btn_update.pack(pady=(40, 5))
+        self.lbl_update = ttk.Label(self.tab_dashboard, text=f"Sürüm: {APP_VERSION}")
+        self.lbl_update.pack()
+
+    def check_for_update(self):
+        if not getattr(sys, "frozen", False):  # only the PyInstaller .exe can replace itself
+            messagebox.showinfo("Güncelleme", "Güncelleme yalnızca .exe sürümünde çalışır.")
+            return
+        exe = Path(sys.executable)
+        new, old = exe.with_suffix(".new"), exe.with_suffix(".old")
+        self.btn_update.config(state="disabled")
+        try:
+            request = urllib.request.Request(RELEASE_API, headers={"User-Agent": "OtelYonetim"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                release = json.load(response)
+            if not is_newer(release["tag_name"], APP_VERSION):
+                messagebox.showinfo("Güncelleme", "Program güncel.")
+                return
+            asset = next(a for a in release["assets"] if a["name"] == EXE_NAME)
+            if not messagebox.askyesno("Güncelleme", "Yeni sürüm var. Şimdi indirilsin mi?\n\nKayıtlarınız silinmez."):
+                return
+            sha, done = hashlib.sha256(), 0
+            with urllib.request.urlopen(asset["browser_download_url"], timeout=30) as response, open(new, "wb") as f:
+                while chunk := response.read(256 * 1024):
+                    f.write(chunk)
+                    sha.update(chunk)
+                    done += len(chunk)
+                    self.lbl_update.config(text=f"İndiriliyor… %{done * 100 // asset['size']}")
+                    self.root.update()  # keep the window alive during the download
+            digest = asset.get("digest")  # "sha256:<hex>"; a half-downloaded exe must never replace the working one
+            if done != asset["size"] or (digest and digest != "sha256:" + sha.hexdigest()):
+                raise OSError("download is incomplete or corrupted")
+            old.unlink(missing_ok=True)
+            exe.rename(old)  # Windows lets a running .exe be renamed, but not overwritten
+            try:
+                new.rename(exe)
+            except OSError:
+                old.rename(exe)  # put the working program back
+                raise
+        except (OSError, KeyError, StopIteration, ValueError):
+            new.unlink(missing_ok=True)
+            messagebox.showerror("Güncelleme", "Güncelleme yapılamadı. İnternet bağlantısını kontrol edip tekrar deneyin.")
+            return
+        finally:
+            self.btn_update.config(state="normal")
+            self.lbl_update.config(text=f"Sürüm: {APP_VERSION}")
+        messagebox.showinfo("Güncelleme", "Güncelleme tamamlandı. Program şimdi kapanacak; lütfen yeniden açın.")
+        self.root.destroy()
+
     def refresh_dashboard(self):
         self.cursor.execute("SELECT COUNT(*) FROM reservations WHERE status='Aktif'")
         count = self.cursor.fetchone()[0]
@@ -181,13 +263,13 @@ class HotelApp:
         self.update_finance_report()
 
     def setup_reservations(self):
-        left_frame = ttk.LabelFrame(self.tab_reservations, text="Yeni Rezervasyon / Kayıt Ekle")
+        left_frame = self.form_frame = ttk.LabelFrame(self.tab_reservations)
         left_frame.pack(side="left", fill="y", padx=10, pady=10, ipadx=10, ipady=10)
 
         room_display_list = [f"{room} ({self.room_types[room]})" for room in self.rooms]
 
         ttk.Label(left_frame, text="Oda No:").grid(row=0, column=0, sticky="w", pady=4)
-        self.room_cb = ttk.Combobox(left_frame, values=room_display_list, width=22)
+        self.room_cb = ttk.Combobox(left_frame, values=room_display_list, width=22, state="readonly")
         self.room_cb.grid(row=0, column=1, pady=4)
         self.room_cb.current(0)
         self.room_cb.bind("<<ComboboxSelected>>", self.update_price)
@@ -209,7 +291,6 @@ class HotelApp:
 
         ttk.Label(left_frame, text="Çıkış Tarihi (GG.AA.YYYY):").grid(row=4, column=0, sticky="w", pady=4)
         self.entry_out = ttk.Entry(left_frame)
-        self.entry_out.insert(0, datetime.now().strftime("%d.%m.%Y"))
         self.entry_out.grid(row=4, column=1, pady=4)
         self.entry_out.bind("<KeyRelease>", self.on_date_key)
 
@@ -229,10 +310,11 @@ class HotelApp:
         self.entry_price = ttk.Entry(left_frame)
         self.entry_price.grid(row=7, column=1, pady=4)
 
-        self.update_price(None)
-
-        btn_add = ttk.Button(left_frame, text="Kayıt Ekle", command=self.add_reservation)
-        btn_add.grid(row=8, column=0, columnspan=2, pady=12)
+        self.btn_save = ttk.Button(left_frame, command=self.save_reservation)
+        self.btn_save.grid(row=8, column=0, columnspan=2, pady=(12, 4))
+        self.btn_cancel = ttk.Button(left_frame, text="Vazgeç", command=self.reset_form)
+        self.btn_cancel.grid(row=9, column=0, columnspan=2)
+        self.reset_form()
 
         right_frame = ttk.Frame(self.tab_reservations)
         right_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
@@ -256,20 +338,65 @@ class HotelApp:
         btn_checkout = ttk.Button(btn_action_frame, text="🚪 Seçili Misafirin Çıkışını Yap (Odayı Boşalt)",
                                   command=self.checkout_reservation)
         btn_checkout.pack(side="left", padx=5)
+        ttk.Button(btn_action_frame, text="✏️ Seçili Kaydı Düzenle", command=self.edit_reservation).pack(side="left", padx=5)
         ttk.Button(btn_action_frame, text="📊 Tüm Kayıtları Excel'e Aktar",
                    command=self.export_to_excel).pack(side="right", padx=5)
 
         self.load_reservations()
 
     def on_date_key(self, event):
-        if event.keysym == "BackSpace":  # otherwise a deleted dot would come straight back
-            return
         entry = event.widget
         formatted = format_date(entry.get())
-        if formatted != entry.get():
+        if formatted != entry.get() and event.keysym != "BackSpace":  # else a deleted dot would come straight back
             # shortcut: the cursor jumps to the end, so fixing a digit mid-date is clumsy; track the cursor if that annoys
             entry.delete(0, tk.END)
             entry.insert(0, formatted)
+        if entry is self.entry_out:
+            self.update_price(None)  # the number of nights may have changed
+
+    def form_check_in(self):
+        """Check-in date of the record in the form: the stored one when editing, today for a new guest."""
+        return self.editing_check_in or datetime.now().strftime(DATE_FORMAT)
+
+    def reset_form(self):
+        """Empty the form and put it back in "new guest" mode."""
+        self.editing_id = self.editing_check_in = None
+        for entry in (self.entry_name, self.entry_tc, self.entry_birth, self.entry_out):
+            entry.delete(0, tk.END)
+        self.entry_out.insert(0, (datetime.now() + timedelta(days=1)).strftime(DATE_FORMAT))
+        self.payment_cb.current(0)  # do not carry an edited guest's choices over to the next one
+        self.extra_person_cb.current(0)
+        self.form_frame.config(text="Yeni Rezervasyon / Kayıt Ekle")
+        self.btn_save.config(text="Kayıt Ekle")
+        self.btn_cancel.grid_remove()
+        self.update_price(None)
+
+    def edit_reservation(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Uyarı", "Lütfen düzenlenecek kaydı listeden seçin.")
+            return
+        rec_id = self.tree.item(selected[0])["values"][0]
+        self.cursor.execute(
+            "SELECT room_no, guest_name, tc_no, birth_year, check_in, check_out, payment_type, extra_person, price "
+            "FROM reservations WHERE id=?", (rec_id,))
+        room, name, tc, birth, check_in, check_out, payment, extra, price = self.cursor.fetchone()
+
+        self.reset_form()
+        self.editing_id, self.editing_check_in = rec_id, check_in
+        self.room_cb.current(self.rooms.index(room))
+        self.entry_name.insert(0, name)
+        self.entry_tc.insert(0, tc)
+        self.entry_birth.insert(0, birth or "")
+        self.entry_out.delete(0, tk.END)
+        self.entry_out.insert(0, check_out)
+        self.payment_cb.set(payment)
+        self.extra_person_cb.set(extra)
+        self.entry_price.delete(0, tk.END)
+        self.entry_price.insert(0, f"{price:g}")  # the saved price, not a recalculated one
+        self.form_frame.config(text=f"Kaydı Düzenle (Oda {room})")
+        self.btn_save.config(text="Değişiklikleri Kaydet")
+        self.btn_cancel.grid()
 
     def update_price(self, event):
         selected_text = self.room_cb.get()
@@ -285,11 +412,12 @@ class HotelApp:
 
         if extra == "Var":
             price += 500
+        price *= count_nights(self.form_check_in(), self.entry_out.get())
 
         self.entry_price.delete(0, tk.END)
         self.entry_price.insert(0, str(price))
 
-    def add_reservation(self):
+    def save_reservation(self):
         selected_text = self.room_cb.get()
         room = selected_text.split(" ")[0]
         name = self.entry_name.get()
@@ -307,21 +435,30 @@ class HotelApp:
             messagebox.showerror("Hata", "Lütfen kalan adı soyadı ve TC Kimlik No alanlarını doldurun!")
             return
 
-        error = validate(tc, birth, cout)
+        check_in = self.form_check_in()
+        error = validate(tc, birth, cout, check_in)
         if error:
             messagebox.showerror("Hata", error)
             return
 
-        self.cursor.execute("SELECT * FROM reservations WHERE room_no=? AND status='Aktif'", (room,))
+        # "id IS NOT ?" skips the record being edited; with None (new guest) it skips nothing.
+        self.cursor.execute("SELECT * FROM reservations WHERE room_no=? AND status='Aktif' AND id IS NOT ?",
+                            (room, self.editing_id))
         if self.cursor.fetchone():
             messagebox.showerror("Hata", f"Oda {room} zaten dolu! Lütfen önce o odanın çıkışını yapın.")
             return
 
-        self.cursor.execute(
-            "INSERT INTO reservations (room_no, guest_name, tc_no, birth_year, check_in, check_out, payment_type, extra_person, price, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (room, name, tc, birth, datetime.now().strftime("%d.%m.%Y"), cout, payment, extra, price, "Aktif"))
+        if self.editing_id:
+            self.cursor.execute(
+                "UPDATE reservations SET room_no=?, guest_name=?, tc_no=?, birth_year=?, check_out=?, payment_type=?, extra_person=?, price=? WHERE id=?",
+                (room, name, tc, birth, cout, payment, extra, price, self.editing_id))
+        else:
+            self.cursor.execute(
+                "INSERT INTO reservations (room_no, guest_name, tc_no, birth_year, check_in, check_out, payment_type, extra_person, price, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (room, name, tc, birth, check_in, cout, payment, extra, price, "Aktif"))
         self.conn.commit()
-        messagebox.showinfo("Başarılı", "Rezervasyon başarıyla eklendi!")
+        messagebox.showinfo("Başarılı", "Kayıt güncellendi!" if self.editing_id else "Rezervasyon başarıyla eklendi!")
+        self.reset_form()
         self.load_reservations()
         self.refresh_dashboard()
 
@@ -366,6 +503,7 @@ class HotelApp:
             # Keep the record: the cash report and the Excel export need past guests too.
             self.cursor.execute("UPDATE reservations SET status='Çıkış yaptı' WHERE id=?", (rec_id,))
             self.conn.commit()
+            self.reset_form()  # the form may still hold this guest for editing
             self.load_reservations()
             self.refresh_dashboard()
             messagebox.showinfo("Bilgi", f"Misafir çıkışı yapıldı. Oda {room_no} artık boş.")
@@ -432,6 +570,15 @@ class HotelApp:
         ttk.Label(finance_frame, text="📊 İzmit My House Butik - Kasa ve Finansal Durum Raporu",
                   font=("Arial", 16, "bold")).pack(pady=10)
 
+        period_frame = ttk.Frame(finance_frame)
+        period_frame.pack(anchor="w", pady=10)
+        ttk.Label(period_frame, text="Dönem:", font=("Arial", 12)).pack(side="left")
+        self.finance_period = ttk.Combobox(period_frame, values=["Bugün", "Bu Ay", "Tümü"], width=10, state="readonly")
+        self.finance_period.pack(side="left", padx=8)
+        self.finance_period.current(0)
+        self.finance_period.bind("<<ComboboxSelected>>", lambda event: self.update_finance_report())
+        ttk.Label(period_frame, text="(ücret, misafirin giriş yaptığı güne sayılır)").pack(side="left")
+
         self.lbl_nakit = ttk.Label(finance_frame, text="Nakit Ödemeler Toplamı: 0 TL", font=("Arial", 12))
         self.lbl_nakit.pack(anchor="w", pady=10)
 
@@ -451,7 +598,12 @@ class HotelApp:
         btn_fin_refresh.pack(pady=20)
 
     def update_finance_report(self):
-        self.cursor.execute("SELECT payment_type, SUM(price) FROM reservations GROUP BY payment_type")
+        now = datetime.now()
+        # check_in is stored as GG.AA.YYYY text, so a period is a LIKE pattern on it.
+        pattern = {"Bugün": now.strftime(DATE_FORMAT), "Bu Ay": now.strftime("%%.%m.%Y"), "Tümü": "%"}[self.finance_period.get()]
+        self.cursor.execute(
+            "SELECT payment_type, SUM(price) FROM reservations WHERE COALESCE(check_in, '') LIKE ? GROUP BY payment_type",
+            (pattern,))
         totals = {"Nakit": 0.0, "Kredi Kartı": 0.0, "EFT": 0.0}
         for row in self.cursor.fetchall():
             p_type, p_sum = row

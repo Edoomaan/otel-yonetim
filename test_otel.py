@@ -5,7 +5,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from otel import export_excel, format_date, is_valid_tc, validate
+from otel import count_nights, export_excel, format_date, is_newer, is_valid_tc, validate
 
 TC = "10000000146"  # 10th digit: (1+0+0+0+1)*7 - 0 = 14 -> 4; 11th: digit sum 6 -> 6
 assert is_valid_tc(TC)
@@ -15,12 +15,22 @@ assert not is_valid_tc("00000000000")           # cannot start with 0
 assert not is_valid_tc("1000000014")            # 10 digits
 assert not is_valid_tc("1000000014a")           # not a number
 
-assert validate(TC, "", "25.11.2026") is None             # birth date is optional
-assert validate(TC, "05.03.1990", "25.11.2026") is None
-assert validate("12345678901", "", "25.11.2026")          # fails the checksum
-assert validate(TC, "1990", "25.11.2026")                 # birth date must be a full date
-assert validate(TC, "", "2026-11-25")                     # wrong date format
-assert validate(TC, "", "31.02.2026")                     # impossible date
+IN = "24.11.2026"
+assert validate(TC, "", "25.11.2026", IN) is None             # birth date is optional
+assert validate(TC, "05.03.1990", "25.11.2026", IN) is None
+assert validate(TC, "", IN, IN) is None                       # same-day check-out is allowed
+assert validate("12345678901", "", "25.11.2026", IN)          # fails the checksum
+assert validate(TC, "1990", "25.11.2026", IN)                 # birth date must be a full date
+assert validate(TC, "", "2026-11-25", IN)                     # wrong date format
+assert validate(TC, "", "31.02.2026", IN)                     # impossible date
+assert validate(TC, "", "23.11.2026", IN)                     # check-out before check-in
+
+assert count_nights("30.11.2026", "02.12.2026") == 2          # across a month end
+assert count_nights(IN, IN) == 1                              # same day still costs one night
+assert count_nights(IN, "25.1") == 1                          # date still being typed
+
+assert is_newer("v3", "2") and is_newer("v10", "9")           # numbers, not text: "10" > "9"
+assert not is_newer("v2", "2") and not is_newer("v1", "2") and not is_newer("latest", "2")
 
 assert [format_date(x) for x in ("1", "12", "123", "1203", "12031990", "120319901", "12.03.1990")] == \
        ["1", "12.", "12.3", "12.03.", "12.03.1990", "12.03.1990", "12.03.1990"]
