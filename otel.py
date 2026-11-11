@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import urllib.request
@@ -46,6 +47,18 @@ def count_nights(check_in, check_out):
     """Nights between two dates: at least 1, and 1 while a date is still being typed."""
     start, end = parse_date(check_in), parse_date(check_out)
     return max(1, (end - start).days) if start and end else 1
+
+
+def backup_database(db_path, backup_dir, today, keep=30):
+    """Copy the database once per day into backup_dir and keep only the newest `keep` copies."""
+    target = backup_dir / f"hotel_{today:%Y-%m-%d}.db"
+    if not db_path.exists() or target.exists():
+        return
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(db_path, target)
+    # The date in the name sorts as text in time order, so the oldest files come first.
+    for old in sorted(backup_dir.glob("hotel_*.db"))[:-keep]:
+        old.unlink()
 
 
 def is_newer(tag, current):
@@ -130,6 +143,10 @@ class HotelApp:
 
         # Veritabanı bağlantısı
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:  # before connecting, so the file is copied while nothing is writing to it
+            backup_database(DATA_DIR / "hotel.db", DATA_DIR / "yedekler", datetime.now())
+        except OSError:
+            pass  # a failed backup must not stop the reception from working
         self.conn = sqlite3.connect(DATA_DIR / "hotel.db")
         self.cursor = self.conn.cursor()
         self.create_table()

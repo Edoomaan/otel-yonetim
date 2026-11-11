@@ -1,11 +1,12 @@
 """Self-check for the logic that does not need a window. Run: python test_otel.py"""
 import sqlite3
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openpyxl import load_workbook
 
-from otel import count_nights, export_excel, format_date, is_newer, is_valid_tc, validate
+from otel import backup_database, count_nights, export_excel, format_date, is_newer, is_valid_tc, validate
 
 TC = "10000000146"  # 10th digit: (1+0+0+0+1)*7 - 0 = 14 -> 4; 11th: digit sum 6 -> 6
 assert is_valid_tc(TC)
@@ -49,4 +50,17 @@ with tempfile.TemporaryDirectory() as tmp:
 assert len(rows) == 3, rows                      # header + checked-out guest + active guest
 assert rows[1][:4] == ("101", "Büyük Oda", "Ali Veli", "12345678901"), rows[1]  # TC stays text
 assert rows[2][-2:] == (2650, "Aktif"), rows[2]
+with tempfile.TemporaryDirectory() as tmp:
+    db, backups, day = Path(tmp) / "hotel.db", Path(tmp) / "yedekler", datetime(2026, 11, 11)
+    backup_database(db, backups, day)                        # no database yet: nothing to do
+    assert not backups.exists()
+    db.write_text("first")
+    backup_database(db, backups, day)
+    db.write_text("changed later the same day")
+    backup_database(db, backups, day)                        # one copy per day; the morning copy is kept
+    assert [(f.name, f.read_text()) for f in backups.iterdir()] == [("hotel_2026-11-11.db", "first")]
+    for i in range(1, 5):
+        backup_database(db, backups, day + timedelta(days=i), keep=3)
+    assert sorted(f.name for f in backups.iterdir()) == \
+           ["hotel_2026-11-13.db", "hotel_2026-11-14.db", "hotel_2026-11-15.db"]   # oldest ones pruned
 print("ok")
