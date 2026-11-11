@@ -5,11 +5,14 @@ import json
 import os
 import shutil
 import sqlite3
+import ssl
 import sys
+import traceback
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import certifi
 from openpyxl import Workbook
 
 # Fixed per-user folder, so the data survives moving the .exe around.
@@ -19,6 +22,9 @@ DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "OtelYonetim"
 APP_VERSION = "0"
 RELEASE_API = "https://api.github.com/repos/Edoomaan/otel-yonetim/releases/latest"
 EXE_NAME = "OtelYonetim.exe"
+# Python on Windows only sees the certificates Windows has already fetched, which on a fresh
+# install is too few to verify github.com. certifi ships a complete list inside the .exe.
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 DATE_FORMAT = "%d.%m.%Y"
 
 EXPORT_HEADERS = ["Oda No", "Oda Tipi", "Ad Soyad", "TC No", "Doğum Tarihi", "Giriş", "Çıkış", "Ödeme", "3. Kişi", "Ücret", "Durum"]
@@ -113,6 +119,12 @@ class HotelApp:
         self.root = root
         self.root.title("İzmit My House Butik - Otel Yönetim Sistemi")
         self.root.geometry("1300x780")
+        if sys.platform == "win32":
+            self.root.state("zoomed")  # start maximized so nothing falls off a small screen
+        # A windowed .exe has no console: without this, an error in a button handler would vanish silently.
+        self.root.report_callback_exception = lambda *exc_info: messagebox.showerror(
+            "Beklenmeyen Hata", "Bir hata oluştu. Lütfen bu pencerenin fotoğrafını gönderin.\n\n"
+                                + "".join(traceback.format_exception(*exc_info))[-1500:])
 
         # Oda tipleri dağılımı
         self.room_types = {
@@ -236,7 +248,7 @@ class HotelApp:
         self.btn_update.config(state="disabled")
         try:
             request = urllib.request.Request(RELEASE_API, headers={"User-Agent": "OtelYonetim"})
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=15, context=SSL_CONTEXT) as response:
                 release = json.load(response)
             if not is_newer(release["tag_name"], APP_VERSION):
                 messagebox.showinfo("Güncelleme", "Program güncel.")
@@ -245,7 +257,7 @@ class HotelApp:
             if not messagebox.askyesno("Güncelleme", "Yeni sürüm var. Şimdi indirilsin mi?\n\nKayıtlarınız silinmez."):
                 return
             sha, done = hashlib.sha256(), 0
-            with urllib.request.urlopen(asset["browser_download_url"], timeout=30) as response, open(new, "wb") as f:
+            with urllib.request.urlopen(asset["browser_download_url"], timeout=30, context=SSL_CONTEXT) as response, open(new, "wb") as f:
                 while chunk := response.read(256 * 1024):
                     f.write(chunk)
                     sha.update(chunk)
@@ -262,9 +274,11 @@ class HotelApp:
             except OSError:
                 old.rename(exe)  # put the working program back
                 raise
-        except (OSError, KeyError, StopIteration, ValueError):
+        except (OSError, KeyError, StopIteration, ValueError) as error:
             new.unlink(missing_ok=True)
-            messagebox.showerror("Güncelleme", "Güncelleme yapılamadı. İnternet bağlantısını kontrol edip tekrar deneyin.")
+            # The detail line is for whoever supports the user: it names the real cause.
+            messagebox.showerror("Güncelleme", "Güncelleme yapılamadı. İnternet bağlantısını kontrol edip tekrar deneyin.\n\n"
+                                               f"Ayrıntı: {type(error).__name__}: {error}")
             return
         finally:
             self.btn_update.config(state="normal")
@@ -348,11 +362,13 @@ class HotelApp:
         for col in cols:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=80)
-        self.tree.pack(fill="both", expand=True, pady=5)
+        self.tree.bind("<Double-1>", lambda event: self.tree.selection() and self.edit_reservation())
 
+        # Packed before the table and pinned to the bottom: a short window shrinks the table, not the buttons.
         btn_action_frame = ttk.Frame(right_frame)
-        btn_action_frame.pack(fill="x", pady=5)
-        btn_checkout = ttk.Button(btn_action_frame, text="🚪 Seçili Misafirin Çıkışını Yap (Odayı Boşalt)",
+        btn_action_frame.pack(side="bottom", fill="x", pady=5)
+        self.tree.pack(fill="both", expand=True, pady=5)
+        btn_checkout = ttk.Button(btn_action_frame, text="🚪 Seçili Misafirin Çıkışını Yap",
                                   command=self.checkout_reservation)
         btn_checkout.pack(side="left", padx=5)
         ttk.Button(btn_action_frame, text="✏️ Seçili Kaydı Düzenle", command=self.edit_reservation).pack(side="left", padx=5)
