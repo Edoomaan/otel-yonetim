@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -26,6 +27,7 @@ EXE_NAME = "OtelYonetim.exe"
 # install is too few to verify github.com. certifi ships a complete list inside the .exe.
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 DATE_FORMAT = "%d.%m.%Y"
+PASSWORD_FILE = DATA_DIR / "parola.txt"  # deleting this file makes the program ask for a new password
 
 EXPORT_HEADERS = ["Oda No", "Oda Tipi", "Ad Soyad", "TC No", "Doğum Tarihi", "Giriş", "Çıkış", "Ödeme", "3. Kişi", "Ücret", "Durum"]
 
@@ -53,6 +55,25 @@ def count_nights(check_in, check_out):
     """Nights between two dates: at least 1, and 1 while a date is still being typed."""
     start, end = parse_date(check_in), parse_date(check_out)
     return max(1, (end - start).days) if start and end else 1
+
+
+def hash_password(password, salt):
+    # Deliberately slow (200,000 rounds) so guessing passwords one after another is slow too.
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+
+
+def make_password_record(password):
+    """Return "salt:hash" to store on disk; the password itself is never stored."""
+    salt = os.urandom(16)
+    return f"{salt.hex()}:{hash_password(password, salt).hex()}"
+
+
+def check_password(password, record):
+    try:
+        salt, expected = (bytes.fromhex(part) for part in record.strip().split(":"))
+    except ValueError:  # damaged file
+        return False
+    return hmac.compare_digest(hash_password(password, salt), expected)
 
 
 def backup_database(db_path, backup_dir, today, keep=30):
@@ -109,6 +130,9 @@ def export_excel(conn, path, room_types):
         "FROM reservations ORDER BY id")
     for row in rows:
         ws.append([row[0], room_types.get(row[0], "")] + list(row[1:]))
+        for cell in ws[ws.max_row]:
+            if cell.data_type == "f":  # text starting with "=" would run as a formula when Excel opens the file
+                cell.data_type = "s"
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 18
     wb.save(path)
@@ -654,7 +678,50 @@ class HotelApp:
         self.lbl_genel_toplam.config(text=f"Genel Kasa Toplamı: {genel:,.2f} TL")
 
 
+def show_login(root, on_success):
+    """Ask for the password inside the main window; on the first run, ask to choose one."""
+    first_run = not PASSWORD_FILE.exists()
+    frame = ttk.Frame(root, padding=30)
+    frame.pack(expand=True)
+    ttk.Label(frame, text="İzmit My House Butik", font=("Arial", 14, "bold")).pack(pady=(0, 15))
+    ttk.Label(frame, text="Yeni bir parola belirleyin (en az 4 karakter):" if first_run else "Parola:").pack(anchor="w")
+    entry = ttk.Entry(frame, show="*", width=32)
+    entry.pack(pady=5)
+    entry.focus_set()
+    if first_run:
+        ttk.Label(frame, text="Parolayı tekrar yazın:").pack(anchor="w")
+        repeat = ttk.Entry(frame, show="*", width=32)
+        repeat.pack(pady=5)
+        ttk.Label(frame, text="Bu parola programın her açılışında sorulacak.").pack()
+    message = ttk.Label(frame, foreground="red")
+    message.pack()
+
+    def submit(event=None):
+        password = entry.get()
+        if first_run:
+            if len(password) < 4:
+                message.config(text="Parola en az 4 karakter olmalıdır.")
+                return
+            if password != repeat.get():
+                message.config(text="İki parola aynı değil.")
+                return
+            PASSWORD_FILE.write_text(make_password_record(password))
+        elif not check_password(password, PASSWORD_FILE.read_text()):
+            message.config(text="Parola yanlış.")
+            entry.delete(0, tk.END)
+            return
+        root.unbind("<Return>")
+        frame.destroy()
+        on_success()
+
+    ttk.Button(frame, text="Kaydet ve Aç" if first_run else "Giriş", command=submit).pack(pady=10)
+    root.bind("<Return>", submit)
+
+
 if __name__ == "__main__":
     root = tk.Tk()
-    app = HotelApp(root)
+    root.title("İzmit My House Butik - Otel Yönetim Sistemi")
+    root.geometry("460x320")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    show_login(root, lambda: HotelApp(root))
     root.mainloop()

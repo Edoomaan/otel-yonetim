@@ -6,7 +6,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from otel import backup_database, count_nights, export_excel, format_date, is_newer, is_valid_tc, validate
+from otel import backup_database, check_password, count_nights, export_excel, format_date, is_newer, is_valid_tc, make_password_record, validate
 
 TC = "10000000146"  # 10th digit: (1+0+0+0+1)*7 - 0 = 14 -> 4; 11th: digit sum 6 -> 6
 assert is_valid_tc(TC)
@@ -41,12 +41,14 @@ conn.execute("CREATE TABLE reservations (id INTEGER PRIMARY KEY, room_no, guest_
              "check_in, check_out, payment_type, extra_person, price REAL, status)")
 conn.execute("INSERT INTO reservations VALUES (1,'101','Ali Veli','12345678901','1990','10.11.2026','11.11.2026',"
              "'Nakit','Yok',1800,'Çıkış yaptı')")
-conn.execute("INSERT INTO reservations VALUES (2,'404','Ayşe Öz','10987654321','1985','11.11.2026','12.11.2026',"
+conn.execute("INSERT INTO reservations VALUES (2,'404','=1+1','10987654321','1985','11.11.2026','12.11.2026',"
              "'EFT','Var',2650,'Aktif')")
 with tempfile.TemporaryDirectory() as tmp:
     path = Path(tmp) / "out.xlsx"
     export_excel(conn, path, {"101": "Büyük Oda", "404": "Suit Oda"})
-    rows = list(load_workbook(path).active.values)
+    sheet = load_workbook(path).active
+    rows = list(sheet.values)
+assert (sheet["C3"].value, sheet["C3"].data_type) == ("=1+1", "s")   # a name starting with "=" stays text, not a formula
 assert len(rows) == 3, rows                      # header + checked-out guest + active guest
 assert rows[1][:4] == ("101", "Büyük Oda", "Ali Veli", "12345678901"), rows[1]  # TC stays text
 assert rows[2][-2:] == (2650, "Aktif"), rows[2]
@@ -63,4 +65,9 @@ with tempfile.TemporaryDirectory() as tmp:
         backup_database(db, backups, day + timedelta(days=i), keep=3)
     assert sorted(f.name for f in backups.iterdir()) == \
            ["hotel_2026-11-13.db", "hotel_2026-11-14.db", "hotel_2026-11-15.db"]   # oldest ones pruned
+record = make_password_record("gizli1234")
+assert "gizli1234" not in record                              # the password itself is not stored
+assert check_password("gizli1234", record) and not check_password("gizli123", record)
+assert make_password_record("gizli1234") != record            # a new random salt every time
+assert not check_password("gizli1234", "damaged file")
 print("ok")
