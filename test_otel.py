@@ -39,7 +39,7 @@ conn.executemany("INSERT INTO reservations (room_no, guest_name, tc_no, birth_ye
                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
     ("101", "Ali Veli", TC, "1990", "03.11.2026", "Nakit", 1800, "Çıkış yaptı"),
     ("101", "=1+1", "11111111110", "05.03.1985", "03.11.2026", "EFT", 500, "Çıkış yaptı"),   # old full birth date
-    ("404", "Ayşe Öz", TC, "", "03.11.2026", "Kredi Kartı", 2150, "Aktif"),
+    ("404", "Ayşe Öz", TC, "", "03.11.2026", "Fiş", 2150, "Aktif"),
     ("205", "Can Er", TC, "2001", "04.11.2026", "Nakit", 1700, "Aktif"),
     ("302", "Nisan Misafiri", TC, "1970", "30.04.2026", "Nakit", 1800, "Çıkış yaptı"),
     ("303", "Tarihsiz", TC, "1970", None, "Nakit", 999, "Aktif"),                           # no date: left out

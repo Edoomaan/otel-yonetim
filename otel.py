@@ -38,7 +38,7 @@ WEEKDAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi"
 REGISTER_HEADERS = {"B": "SIRA NO", "C": "ODA NO", "D": "RESEPSİYONİST", "F": "TC NO", "H": "ADI SOYADI", "J": "TELEFON",
                     "K": "DOĞUM YILI", "L": "ÇIKIŞ SAATİ", "N": "ÜCRET", "R": "EFT"}
 REGISTER_SUBHEADERS = {"N": "NAKİT", "O": "FİŞ", "P": "EFT", "Q": "TOPLAM", "R": "GÖNDEREN"}
-PAYMENT_COLUMNS = {"Nakit": "N", "Kredi Kartı": "O", "EFT": "P"}
+PAYMENT_COLUMNS = {"Nakit": "N", "Fiş": "O", "EFT": "P"}
 
 
 def is_valid_tc(tc):
@@ -319,6 +319,8 @@ class HotelApp:
             self.cursor.execute("ALTER TABLE reservations ADD COLUMN extra_income REAL DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # already there
+        # Versions 1-4 called this payment type "Kredi Kartı"; the hotel's own books call it "Fiş".
+        self.cursor.execute("UPDATE reservations SET payment_type='Fiş' WHERE payment_type='Kredi Kartı'")
         self.conn.commit()
 
     def setup_dashboard(self):
@@ -428,7 +430,7 @@ class HotelApp:
         self.entry_date.bind("<KeyRelease>", self.on_date_key)
 
         ttk.Label(left_frame, text="Ödeme Şekli:").grid(row=5, column=0, sticky="w", pady=4)
-        self.payment_cb = ttk.Combobox(left_frame, values=["Nakit", "Kredi Kartı", "EFT"], width=22, state="readonly")
+        self.payment_cb = ttk.Combobox(left_frame, values=["Nakit", "Fiş", "EFT"], width=22, state="readonly")
         self.payment_cb.grid(row=5, column=1, pady=4)
         self.payment_cb.current(0)
         self.payment_cb.bind("<<ComboboxSelected>>", self.update_price)
@@ -706,7 +708,7 @@ class HotelApp:
         self.lbl_nakit = ttk.Label(finance_frame, text="Nakit Ödemeler Toplamı: 0 TL", font=("Arial", 12))
         self.lbl_nakit.pack(anchor="w", pady=10)
 
-        self.lbl_kart = ttk.Label(finance_frame, text="Kredi Kartı Ödemeleri Toplamı: 0 TL", font=("Arial", 12))
+        self.lbl_kart = ttk.Label(finance_frame, text="Fiş Ödemeleri Toplamı: 0 TL", font=("Arial", 12))
         self.lbl_kart.pack(anchor="w", pady=10)
 
         self.lbl_eft = ttk.Label(finance_frame, text="EFT Ödemeleri Toplamı: 0 TL", font=("Arial", 12))
@@ -728,19 +730,19 @@ class HotelApp:
         self.cursor.execute(
             "SELECT payment_type, SUM(price) FROM reservations WHERE COALESCE(check_in, '') LIKE ? GROUP BY payment_type",
             (pattern,))
-        totals = {"Nakit": 0.0, "Kredi Kartı": 0.0, "EFT": 0.0}
+        totals = {"Nakit": 0.0, "Fiş": 0.0, "EFT": 0.0}
         for row in self.cursor.fetchall():
             p_type, p_sum = row
             if p_type in totals:
                 totals[p_type] = p_sum if p_sum else 0.0
 
         nakit = totals["Nakit"]
-        kart = totals["Kredi Kartı"]
+        kart = totals["Fiş"]
         eft = totals["EFT"]
         genel = nakit + kart + eft
 
         self.lbl_nakit.config(text=f"Nakit Ödemeler Toplamı: {nakit:,.2f} TL")
-        self.lbl_kart.config(text=f"Kredi Kartı Ödemeleri Toplamı: {kart:,.2f} TL")
+        self.lbl_kart.config(text=f"Fiş Ödemeleri Toplamı: {kart:,.2f} TL")
         self.lbl_eft.config(text=f"EFT Ödemeleri Toplamı: {eft:,.2f} TL")
         self.lbl_genel_toplam.config(text=f"Genel Kasa Toplamı: {genel:,.2f} TL")
 
