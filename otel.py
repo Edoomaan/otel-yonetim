@@ -1,3 +1,4 @@
+import calendar
 import tkinter as tk
 from tkinter import ttk, messagebox
 import hashlib
@@ -10,11 +11,12 @@ import ssl
 import sys
 import traceback
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import certifi
 from openpyxl import Workbook
+from openpyxl.styles import Font
 
 # Fixed per-user folder, so the data survives moving the .exe around.
 DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "OtelYonetim"
@@ -29,7 +31,14 @@ SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 DATE_FORMAT = "%d.%m.%Y"
 PASSWORD_FILE = DATA_DIR / "parola.txt"  # deleting this file makes the program ask for a new password
 
-EXPORT_HEADERS = ["Oda No", "Oda Tipi", "Ad Soyad", "TC No", "Doğum Tarihi", "Giriş", "Çıkış", "Ödeme", "3. Kişi", "Ücret", "Durum"]
+MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+WEEKDAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+# Same columns as the hotel's own "KAYIT DEFTERİ" workbook, so a day can be copied straight into it.
+# The program does not collect RESEPSİYONİST, TELEFON, ÇIKIŞ SAATİ or EFT GÖNDEREN; those stay empty.
+REGISTER_HEADERS = {"B": "SIRA NO", "C": "ODA NO", "D": "RESEPSİYONİST", "F": "TC NO", "H": "ADI SOYADI", "J": "TELEFON",
+                    "K": "DOĞUM YILI", "L": "ÇIKIŞ SAATİ", "N": "ÜCRET", "R": "EFT"}
+REGISTER_SUBHEADERS = {"N": "NAKİT", "O": "FİŞ", "P": "EFT", "Q": "TOPLAM", "R": "GÖNDEREN"}
+PAYMENT_COLUMNS = {"Nakit": "N", "Kredi Kartı": "O", "EFT": "P"}
 
 
 def is_valid_tc(tc):
@@ -49,12 +58,6 @@ def parse_date(text):
         return datetime.strptime(text, DATE_FORMAT)
     except ValueError:
         return None
-
-
-def count_nights(check_in, check_out):
-    """Nights between two dates: at least 1, and 1 while a date is still being typed."""
-    start, end = parse_date(check_in), parse_date(check_out)
-    return max(1, (end - start).days) if start and end else 1
 
 
 def hash_password(password, salt):
@@ -106,36 +109,106 @@ def format_date(text):
     return f"{d[:2]}.{d[2:4]}.{d[4:]}"
 
 
-def validate(tc, birth, check_out, check_in):
+def validate(tc, birth_year, reg_date):
     """Return an error message, or None when the input is fine."""
     if not is_valid_tc(tc):
         return "Geçersiz TC Kimlik No! 11 haneyi kontrol edip tekrar girin."
-    if birth and not parse_date(birth):
-        return "Doğum tarihi GG.AA.YYYY biçiminde olmalıdır! (örnek: 05.03.1990)"
-    if not parse_date(check_out):
-        return "Çıkış tarihi GG.AA.YYYY biçiminde olmalıdır! (örnek: 25.11.2026)"
-    if parse_date(check_out) < parse_date(check_in):
-        return f"Çıkış tarihi giriş tarihinden ({check_in}) önce olamaz!"
+    if birth_year and not (birth_year.isdigit() and 1900 <= int(birth_year) <= datetime.now().year):
+        return "Doğum yılı 4 haneli bir yıl olmalıdır! (örnek: 1990)"
+    if not parse_date(reg_date):
+        return "Kayıt tarihi GG.AA.YYYY biçiminde olmalıdır! (örnek: 25.11.2026)"
     return None
 
 
-def export_excel(conn, path, room_types):
-    """Write every reservation (active and checked out) to an .xlsx file."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Kayıtlar"
-    ws.append(EXPORT_HEADERS)
+def load_stays(conn):
+    """Group every reservation as {(year, month): {day: {room: [(name, tc, birth_year, payment, price), ...]}}}."""
+    stays = {}
     rows = conn.execute(
-        "SELECT room_no, guest_name, tc_no, birth_year, check_in, check_out, payment_type, extra_person, price, status "
-        "FROM reservations ORDER BY id")
-    for row in rows:
-        ws.append([row[0], room_types.get(row[0], "")] + list(row[1:]))
-        for cell in ws[ws.max_row]:
-            if cell.data_type == "f":  # text starting with "=" would run as a formula when Excel opens the file
-                cell.data_type = "s"
-    for col in ws.columns:
-        ws.column_dimensions[col[0].column_letter].width = 18
+        "SELECT room_no, guest_name, tc_no, birth_year, check_in, payment_type, price FROM reservations ORDER BY id")
+    for room, name, tc, birth, check_in, payment, price in rows:
+        day = parse_date(check_in or "")
+        if day:
+            # shortcut: two separate stays in one room on one day share a block; split them by stay if that ever matters
+            stays.setdefault((day.year, day.month), {}).setdefault(day.day, {}).setdefault(room, []).append(
+                (name, tc, (birth or "")[-4:], payment, price or 0))  # [-4:]: older records hold a full birth date
+    return stays
+
+
+def save_workbook(wb, path):
+    for ws in wb:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.data_type == "f":  # text starting with "=" would run as a formula when Excel opens the file
+                    cell.data_type = "s"
     wb.save(path)
+
+
+def export_register(stays, path):
+    """Guest register in the layout of the hotel's "KAYIT DEFTERİ": a sheet per month, a block per day."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    bold = Font(bold=True)
+    for (year, month), days in sorted(stays.items()):
+        ws = wb.create_sheet(f"{MONTHS[month - 1]} {year}")
+        row = 2
+        for day, rooms in sorted(days.items()):
+            ws[f"B{row}"] = datetime(year, month, day)
+            ws[f"B{row}"].number_format = "DD.MM.YYYY"
+            ws[f"B{row}"].font = bold
+            for headers in (REGISTER_HEADERS, REGISTER_SUBHEADERS):
+                row += 1
+                for column, text in headers.items():
+                    ws[f"{column}{row}"] = text
+                    ws[f"{column}{row}"].font = bold
+            row += 1
+            day_totals = dict.fromkeys(PAYMENT_COLUMNS.values(), 0)
+            for number, (room, guests) in enumerate(sorted(rooms.items()), 1):
+                ws[f"B{row}"], ws[f"C{row}"] = number, int(room)
+                paid = dict.fromkeys(PAYMENT_COLUMNS.values(), 0)
+                for offset, (name, tc, birth, payment, price) in enumerate(guests):
+                    ws[f"F{row + offset}"], ws[f"H{row + offset}"] = tc, name
+                    ws[f"K{row + offset}"] = int(birth) if birth.isdigit() else birth
+                    paid[PAYMENT_COLUMNS.get(payment, "N")] += price
+                for column, amount in paid.items():
+                    ws[f"{column}{row}"] = amount or None  # the room's money goes on its first line only
+                    day_totals[column] += amount
+                ws[f"Q{row}"] = sum(paid.values())
+                row += max(2, len(guests))  # the hotel's sheet gives every room two lines
+            ws[f"M{row}"] = "TOPLAM"
+            for column, amount in day_totals.items():
+                ws[f"{column}{row}"] = amount
+            ws[f"Q{row}"] = sum(day_totals.values())
+            for column in "MNOPQ":
+                ws[f"{column}{row}"].font = bold
+            row += 3
+        for column, width in {"B": 11, "D": 15, "F": 14, "H": 30, "J": 14, "K": 12, "L": 12}.items():
+            ws.column_dimensions[column].width = width
+    save_workbook(wb, path)
+
+
+def export_daily(stays, path, rooms):
+    """Money per room per day in the layout of the hotel's "GÜNLÜK ALINAN": a sheet per month, a row per day."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    for (year, month), days in sorted(stays.items()):
+        ws = wb.create_sheet(f"{MONTHS[month - 1].replace('i', 'İ').upper()} {year}")  # plain upper() would give NISAN
+        ws.append(["GÜNLER", *map(int, rooms), "TOPLAM", "GÜNLER", "S.O.S"])
+        month_days = calendar.monthrange(year, month)[1]
+        room_totals, sold_total = [0] * len(rooms), 0
+        for day in range(1, month_days + 1):
+            day_rooms = days.get(day, {})
+            amounts = [sum(guest[4] for guest in day_rooms.get(room, [])) for room in rooms]
+            ws.append([day, *(amount or None for amount in amounts), sum(amounts),
+                       WEEKDAYS[datetime(year, month, day).weekday()], len(day_rooms) or None])
+            room_totals = [total + amount for total, amount in zip(room_totals, amounts)]
+            sold_total += len(day_rooms)
+        # Row 33 as in the hotel's sheet, whatever the month length. S.O.S = number of rooms sold that day.
+        totals = ["TOPLAM", *room_totals, sum(room_totals), round(sum(room_totals) / month_days), sold_total]
+        for column, value in enumerate(totals, 1):
+            ws.cell(row=33, column=column, value=value).font = Font(bold=True)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+    save_workbook(wb, path)
 
 
 class HotelApp:
@@ -242,6 +315,10 @@ class HotelApp:
                                 TEXT
                             )
                             ''')
+        try:  # databases created by versions 1-3 do not have this column yet
+            self.cursor.execute("ALTER TABLE reservations ADD COLUMN extra_income REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # already there
         self.conn.commit()
 
     def setup_dashboard(self):
@@ -334,20 +411,21 @@ class HotelApp:
         self.entry_name.grid(row=1, column=1, pady=4)
 
         ttk.Label(left_frame, text="TC Kimlik No:").grid(row=2, column=0, sticky="w", pady=4)
-        # Reject the keystroke unless the field would still be at most 11 digits (%P = text after the edit).
-        only_tc_digits = (self.root.register(lambda text: len(text) <= 11 and (text.isdigit() or text == "")), "%P")
-        self.entry_tc = ttk.Entry(left_frame, validate="key", validatecommand=only_tc_digits)
+        def digits_only(limit):
+            # Reject the keystroke unless the field would still be at most `limit` digits (%P = text after the edit).
+            return self.root.register(lambda text: len(text) <= limit and (text.isdigit() or text == "")), "%P"
+
+        self.entry_tc = ttk.Entry(left_frame, validate="key", validatecommand=digits_only(11))
         self.entry_tc.grid(row=2, column=1, pady=4)
 
-        ttk.Label(left_frame, text="Doğum Tarihi (GG.AA.YYYY):").grid(row=3, column=0, sticky="w", pady=4)
-        self.entry_birth = ttk.Entry(left_frame)
+        ttk.Label(left_frame, text="Doğum Yılı:").grid(row=3, column=0, sticky="w", pady=4)
+        self.entry_birth = ttk.Entry(left_frame, validate="key", validatecommand=digits_only(4))
         self.entry_birth.grid(row=3, column=1, pady=4)
-        self.entry_birth.bind("<KeyRelease>", self.on_date_key)
 
-        ttk.Label(left_frame, text="Çıkış Tarihi (GG.AA.YYYY):").grid(row=4, column=0, sticky="w", pady=4)
-        self.entry_out = ttk.Entry(left_frame)
-        self.entry_out.grid(row=4, column=1, pady=4)
-        self.entry_out.bind("<KeyRelease>", self.on_date_key)
+        ttk.Label(left_frame, text="Kayıt Tarihi (GG.AA.YYYY):").grid(row=4, column=0, sticky="w", pady=4)
+        self.entry_date = ttk.Entry(left_frame)
+        self.entry_date.grid(row=4, column=1, pady=4)
+        self.entry_date.bind("<KeyRelease>", self.on_date_key)
 
         ttk.Label(left_frame, text="Ödeme Şekli:").grid(row=5, column=0, sticky="w", pady=4)
         self.payment_cb = ttk.Combobox(left_frame, values=["Nakit", "Kredi Kartı", "EFT"], width=22, state="readonly")
@@ -355,20 +433,21 @@ class HotelApp:
         self.payment_cb.current(0)
         self.payment_cb.bind("<<ComboboxSelected>>", self.update_price)
 
-        ttk.Label(left_frame, text="3. Kişi (+500 TL):").grid(row=6, column=0, sticky="w", pady=4)
-        self.extra_person_cb = ttk.Combobox(left_frame, values=["Yok", "Var"], width=22, state="readonly")
-        self.extra_person_cb.grid(row=6, column=1, pady=4)
-        self.extra_person_cb.current(0)
-        self.extra_person_cb.bind("<<ComboboxSelected>>", self.update_price)
+        ttk.Label(left_frame, text="Ek Gelir (TL):").grid(row=6, column=0, sticky="w", pady=4)
+        self.entry_extra = ttk.Entry(left_frame)
+        self.entry_extra.grid(row=6, column=1, pady=4)
+        self.entry_extra.bind("<KeyRelease>", self.update_price)
 
         ttk.Label(left_frame, text="Toplam Ücret (TL):").grid(row=7, column=0, sticky="w", pady=4)
         self.entry_price = ttk.Entry(left_frame)
         self.entry_price.grid(row=7, column=1, pady=4)
+        self.lbl_price_note = ttk.Label(left_frame, foreground="#b35c00", wraplength=300)
+        self.lbl_price_note.grid(row=8, column=0, columnspan=2)
 
         self.btn_save = ttk.Button(left_frame, command=self.save_reservation)
-        self.btn_save.grid(row=8, column=0, columnspan=2, pady=(12, 4))
+        self.btn_save.grid(row=9, column=0, columnspan=2, pady=(12, 4))
         self.btn_cancel = ttk.Button(left_frame, text="Vazgeç", command=self.reset_form)
-        self.btn_cancel.grid(row=9, column=0, columnspan=2)
+        self.btn_cancel.grid(row=10, column=0, columnspan=2)
         self.reset_form()
 
         right_frame = ttk.Frame(self.tab_reservations)
@@ -379,9 +458,9 @@ class HotelApp:
         ttk.Label(search_frame, text="🔍 Müşteri Adı veya Oda No Ara:").pack(side="left", padx=5)
         self.search_entry = ttk.Entry(search_frame, width=30)
         self.search_entry.pack(side="left", padx=5)
-        self.search_entry.bind("<KeyRelease>", self.filter_reservations)
+        self.search_entry.bind("<KeyRelease>", self.load_reservations)
 
-        cols = ("ID", "Oda No", "Oda Tipi", "Kalan Adı", "TC No", "Doğum", "Çıkış", "Ödeme", "3. Kişi", "Ücret")
+        cols = ("ID", "Oda No", "Oda Tipi", "Kalan Adı", "TC No", "Doğum Yılı", "Kayıt Tarihi", "Ödeme", "Ek Gelir", "Ücret")
         self.tree = ttk.Treeview(right_frame, columns=cols, show="headings")
         for col in cols:
             self.tree.heading(col, text=col)
@@ -392,7 +471,7 @@ class HotelApp:
         btn_action_frame = ttk.Frame(right_frame)
         btn_action_frame.pack(side="bottom", fill="x", pady=5)
         self.tree.pack(fill="both", expand=True, pady=5)
-        btn_checkout = ttk.Button(btn_action_frame, text="🚪 Seçili Misafirin Çıkışını Yap",
+        btn_checkout = ttk.Button(btn_action_frame, text="🚪 Seçili Odanın Çıkışını Yap",
                                   command=self.checkout_reservation)
         btn_checkout.pack(side="left", padx=5)
         ttk.Button(btn_action_frame, text="✏️ Seçili Kaydı Düzenle", command=self.edit_reservation).pack(side="left", padx=5)
@@ -408,21 +487,14 @@ class HotelApp:
             # shortcut: the cursor jumps to the end, so fixing a digit mid-date is clumsy; track the cursor if that annoys
             entry.delete(0, tk.END)
             entry.insert(0, formatted)
-        if entry is self.entry_out:
-            self.update_price(None)  # the number of nights may have changed
-
-    def form_check_in(self):
-        """Check-in date of the record in the form: the stored one when editing, today for a new guest."""
-        return self.editing_check_in or datetime.now().strftime(DATE_FORMAT)
 
     def reset_form(self):
         """Empty the form and put it back in "new guest" mode."""
-        self.editing_id = self.editing_check_in = None
-        for entry in (self.entry_name, self.entry_tc, self.entry_birth, self.entry_out):
+        self.editing_id = None
+        for entry in (self.entry_name, self.entry_tc, self.entry_birth, self.entry_date, self.entry_extra):
             entry.delete(0, tk.END)
-        self.entry_out.insert(0, (datetime.now() + timedelta(days=1)).strftime(DATE_FORMAT))
+        self.entry_date.insert(0, datetime.now().strftime(DATE_FORMAT))
         self.payment_cb.current(0)  # do not carry an edited guest's choices over to the next one
-        self.extra_person_cb.current(0)
         self.form_frame.config(text="Yeni Rezervasyon / Kayıt Ekle")
         self.btn_save.config(text="Kayıt Ekle")
         self.btn_cancel.grid_remove()
@@ -435,56 +507,62 @@ class HotelApp:
             return
         rec_id = self.tree.item(selected[0])["values"][0]
         self.cursor.execute(
-            "SELECT room_no, guest_name, tc_no, birth_year, check_in, check_out, payment_type, extra_person, price "
+            "SELECT room_no, guest_name, tc_no, birth_year, check_in, payment_type, extra_income, price "
             "FROM reservations WHERE id=?", (rec_id,))
-        room, name, tc, birth, check_in, check_out, payment, extra, price = self.cursor.fetchone()
+        room, name, tc, birth, reg_date, payment, extra, price = self.cursor.fetchone()
 
         self.reset_form()
-        self.editing_id, self.editing_check_in = rec_id, check_in
+        self.editing_id = rec_id
         self.room_cb.current(self.rooms.index(room))
         self.entry_name.insert(0, name)
         self.entry_tc.insert(0, tc)
-        self.entry_birth.insert(0, birth or "")
-        self.entry_out.delete(0, tk.END)
-        self.entry_out.insert(0, check_out)
+        self.entry_birth.insert(0, (birth or "")[-4:])  # older records hold a full birth date
+        self.entry_date.delete(0, tk.END)
+        self.entry_date.insert(0, reg_date or "")
         self.payment_cb.set(payment)
-        self.extra_person_cb.set(extra)
+        if extra:
+            self.entry_extra.insert(0, f"{extra:g}")
+        self.update_price(None)  # refreshes the note about other guests in the room
         self.entry_price.delete(0, tk.END)
         self.entry_price.insert(0, f"{price:g}")  # the saved price, not a recalculated one
         self.form_frame.config(text=f"Kaydı Düzenle (Oda {room})")
         self.btn_save.config(text="Değişiklikleri Kaydet")
         self.btn_cancel.grid()
 
+    def extra_income(self):
+        try:
+            return float(self.entry_extra.get().replace(",", ".") or 0)
+        except ValueError:
+            return 0.0
+
     def update_price(self, event):
-        selected_text = self.room_cb.get()
-        room_no = selected_text.split(" ")[0]
+        room_no = self.room_cb.get().split(" ")[0]
         room_type = self.room_types.get(room_no, "Küçük Oda")
-        payment = self.payment_cb.get()
-        extra = self.extra_person_cb.get()
+        price = self.prices[room_type]["Nakit" if self.payment_cb.get() == "Nakit" else "Diger"]
 
-        if payment == "Nakit":
-            price = self.prices[room_type]["Nakit"]
-        else:
-            price = self.prices[room_type]["Diger"]
-
-        if extra == "Var":
-            price += 500
-        price *= count_nights(self.form_check_in(), self.entry_out.get())
+        # A room is paid for once: a guest who joins an occupied room adds only the extra income.
+        # When editing, only guests registered before this one count, so the first guest keeps the room price.
+        self.cursor.execute("SELECT guest_name FROM reservations WHERE room_no=? AND status='Aktif' AND (? IS NULL OR id < ?)",
+                            (room_no, self.editing_id, self.editing_id))
+        others = [row[0] for row in self.cursor.fetchall()]
+        if others:
+            price = 0
+        self.lbl_price_note.config(
+            text=f"Bu odada {', '.join(others)} kalıyor; oda ücreti tekrar eklenmedi." if others else "")
+        price += self.extra_income()
 
         self.entry_price.delete(0, tk.END)
-        self.entry_price.insert(0, str(price))
+        self.entry_price.insert(0, f"{price:g}")
 
     def save_reservation(self):
-        selected_text = self.room_cb.get()
-        room = selected_text.split(" ")[0]
-        name = self.entry_name.get()
+        room = self.room_cb.get().split(" ")[0]
+        name = self.entry_name.get().strip()
         tc = self.entry_tc.get()
         birth = self.entry_birth.get()
-        cout = self.entry_out.get()
+        reg_date = self.entry_date.get()
         payment = self.payment_cb.get()
-        extra = self.extra_person_cb.get()
         try:
-            price = float(self.entry_price.get())
+            price = float(self.entry_price.get().replace(",", "."))
         except ValueError:
             price = 0.0
 
@@ -492,91 +570,78 @@ class HotelApp:
             messagebox.showerror("Hata", "Lütfen kalan adı soyadı ve TC Kimlik No alanlarını doldurun!")
             return
 
-        check_in = self.form_check_in()
-        error = validate(tc, birth, cout, check_in)
+        error = validate(tc, birth, reg_date)
         if error:
             messagebox.showerror("Hata", error)
             return
 
-        # "id IS NOT ?" skips the record being edited; with None (new guest) it skips nothing.
-        self.cursor.execute("SELECT * FROM reservations WHERE room_no=? AND status='Aktif' AND id IS NOT ?",
-                            (room, self.editing_id))
-        if self.cursor.fetchone():
-            messagebox.showerror("Hata", f"Oda {room} zaten dolu! Lütfen önce o odanın çıkışını yapın.")
-            return
-
+        values = (room, name, tc, birth, reg_date, payment, self.extra_income(), price)
         if self.editing_id:
             self.cursor.execute(
-                "UPDATE reservations SET room_no=?, guest_name=?, tc_no=?, birth_year=?, check_out=?, payment_type=?, extra_person=?, price=? WHERE id=?",
-                (room, name, tc, birth, cout, payment, extra, price, self.editing_id))
+                "UPDATE reservations SET room_no=?, guest_name=?, tc_no=?, birth_year=?, check_in=?, payment_type=?, extra_income=?, price=? WHERE id=?",
+                values + (self.editing_id,))
         else:
             self.cursor.execute(
-                "INSERT INTO reservations (room_no, guest_name, tc_no, birth_year, check_in, check_out, payment_type, extra_person, price, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (room, name, tc, birth, check_in, cout, payment, extra, price, "Aktif"))
+                "INSERT INTO reservations (room_no, guest_name, tc_no, birth_year, check_in, payment_type, extra_income, price, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Aktif')",
+                values)
         self.conn.commit()
         messagebox.showinfo("Başarılı", "Kayıt güncellendi!" if self.editing_id else "Rezervasyon başarıyla eklendi!")
         self.reset_form()
         self.load_reservations()
         self.refresh_dashboard()
 
-    def load_reservations(self):
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        self.cursor.execute(
-            "SELECT id, room_no, guest_name, tc_no, birth_year, check_out, payment_type, extra_person, price FROM reservations WHERE status='Aktif'")
-        for row in self.cursor.fetchall():
-            rec_id, room_no, guest_name, tc_no, birth_year, check_out, payment_type, extra_person, price = row
-            room_type = self.room_types.get(room_no, "")
-            self.tree.insert("", "end",
-                             values=(rec_id, room_no, room_type, guest_name, tc_no, birth_year, check_out, payment_type,
-                                     extra_person, f"{price} TL"))
-
-    def filter_reservations(self, event):
+    def load_reservations(self, event=None):
+        """Fill the table with the guests currently staying that match the search box (empty box = everyone)."""
         query = self.search_entry.get().lower()
         for i in self.tree.get_children():
             self.tree.delete(i)
         self.cursor.execute(
-            "SELECT id, room_no, guest_name, tc_no, birth_year, check_out, payment_type, extra_person, price FROM reservations WHERE status='Aktif'")
-        for row in self.cursor.fetchall():
-            rec_id, room_no, guest_name, tc_no, birth_year, check_out, payment_type, extra_person, price = row
-            room_type = self.room_types.get(room_no, "")
+            "SELECT id, room_no, guest_name, tc_no, birth_year, check_in, payment_type, extra_income, price "
+            "FROM reservations WHERE status='Aktif'")
+        for rec_id, room_no, guest_name, tc_no, birth, reg_date, payment_type, extra, price in self.cursor.fetchall():
             if query in str(room_no).lower() or query in str(guest_name).lower():
-                self.tree.insert("", "end",
-                                 values=(rec_id, room_no, room_type, guest_name, tc_no, birth_year, check_out,
-                                         payment_type, extra_person, f"{price} TL"))
+                self.tree.insert("", "end", values=(rec_id, room_no, self.room_types.get(room_no, ""), guest_name, tc_no,
+                                                    (birth or "")[-4:], reg_date, payment_type,
+                                                    f"{extra or 0:g} TL", f"{price:g} TL"))
 
     def checkout_reservation(self):
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning("Uyarı", "Lütfen çıkış yapılıp odası boşaltılacak kaydı seçin.")
+            messagebox.showwarning("Uyarı", "Lütfen çıkışı yapılacak odadan bir kaydı seçin.")
             return
-        item = self.tree.item(selected)
-        rec_id = item['values'][0]
-        room_no = item['values'][1]
+        room_no = str(self.tree.item(selected[0])["values"][1])
+        self.cursor.execute("SELECT COUNT(*) FROM reservations WHERE room_no=? AND status='Aktif'", (room_no,))
+        count = self.cursor.fetchone()[0]
 
-        confirm = messagebox.askyesno("Onay",
-                                      f"Oda {room_no} numaralı misafirin çıkışı yapılacak ve oda boşaltılacak. Onaylıyor musunuz?")
-        if confirm:
-            # Keep the record: the cash report and the Excel export need past guests too.
-            self.cursor.execute("UPDATE reservations SET status='Çıkış yaptı' WHERE id=?", (rec_id,))
+        if messagebox.askyesno("Onay", f"Oda {room_no} boşaltılacak ve odadaki {count} misafirin çıkışı yapılacak. "
+                                       "Onaylıyor musunuz?"):
+            # Keep the records: the cash report and the Excel export need past guests too.
+            self.cursor.execute("UPDATE reservations SET status='Çıkış yaptı' WHERE room_no=? AND status='Aktif'", (room_no,))
             self.conn.commit()
-            self.reset_form()  # the form may still hold this guest for editing
+            self.reset_form()  # the form may still hold one of these guests for editing
             self.load_reservations()
             self.refresh_dashboard()
-            messagebox.showinfo("Bilgi", f"Misafir çıkışı yapıldı. Oda {room_no} artık boş.")
+            messagebox.showinfo("Bilgi", f"Çıkış yapıldı. Oda {room_no} artık boş.")
 
     def export_to_excel(self):
+        stays = load_stays(self.conn)
+        if not stays:
+            messagebox.showinfo("Bilgi", "Aktarılacak kayıt yok.")
+            return
         desktop = Path.home() / "Desktop"
         folder = desktop if desktop.is_dir() else Path.home()  # OneDrive can move the Desktop folder
-        path = folder / f"Otel_Kayitlari_{datetime.now():%Y-%m-%d}.xlsx"
+        register = folder / f"Kayit_Defteri_{datetime.now():%Y-%m-%d}.xlsx"
+        daily = folder / f"Gunluk_Alinan_{datetime.now():%Y-%m-%d}.xlsx"
         try:
-            export_excel(self.conn, path, self.room_types)
+            export_register(stays, register)
+            export_daily(stays, daily, self.rooms)
         except PermissionError:
-            messagebox.showerror("Hata", f"Dosya yazılamadı. Excel'de açıksa kapatıp tekrar deneyin:\n{path}")
+            messagebox.showerror("Hata", f"Dosya yazılamadı. Excel'de açıksa kapatıp tekrar deneyin:\n{register}\n{daily}")
             return
-        messagebox.showinfo("Başarılı", f"Excel dosyası oluşturuldu:\n{path}")
+        messagebox.showinfo("Başarılı", f"İki Excel dosyası oluşturuldu:\n{register}\n{daily}")
         if hasattr(os, "startfile"):  # Windows only
-            os.startfile(path)
+            os.startfile(register)
+            os.startfile(daily)
 
     def setup_rooms(self):
         self.rooms_container = ttk.Frame(self.tab_rooms)
@@ -595,7 +660,9 @@ class HotelApp:
         }
 
         self.cursor.execute("SELECT room_no, guest_name FROM reservations WHERE status='Aktif'")
-        occupied_rooms = {row[0]: row[1] for row in self.cursor.fetchall()}
+        occupied_rooms = {}
+        for room_no, guest_name in self.cursor.fetchall():
+            occupied_rooms.setdefault(room_no, []).append(guest_name)
 
         row_idx = 0
         for floor_name, r_list in floors.items():
@@ -610,14 +677,14 @@ class HotelApp:
             for c_idx, room in enumerate(r_list):
                 r_type = self.room_types[room]
                 if room in occupied_rooms:
-                    txt = f"Oda {room} ({r_type})\n[Dolu]\n{occupied_rooms[room]}"
+                    txt = f"Oda {room} ({r_type})\n[Dolu]\n" + "\n".join(occupied_rooms[room])
                     bg = "#ffcdd2"
                 else:
                     txt = f"Oda {room} ({r_type})\n[Boş]"
                     bg = "#c8e6c9"
 
                 lbl_room = tk.Label(f_frame, text=txt, relief="solid", bd=1, padx=5, pady=5, font=("Arial", 9), bg=bg,
-                                    width=18, height=4)
+                                    width=18, height=6)
                 lbl_room.grid(row=0, column=c_idx, padx=4, pady=4)
 
     def setup_finance(self):
@@ -634,7 +701,7 @@ class HotelApp:
         self.finance_period.pack(side="left", padx=8)
         self.finance_period.current(0)
         self.finance_period.bind("<<ComboboxSelected>>", lambda event: self.update_finance_report())
-        ttk.Label(period_frame, text="(ücret, misafirin giriş yaptığı güne sayılır)").pack(side="left")
+        ttk.Label(period_frame, text="(ücret, kayıt tarihine sayılır)").pack(side="left")
 
         self.lbl_nakit = ttk.Label(finance_frame, text="Nakit Ödemeler Toplamı: 0 TL", font=("Arial", 12))
         self.lbl_nakit.pack(anchor="w", pady=10)
